@@ -4,6 +4,24 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+from sklearn import metrics
+
+# --- Attempt to import TensorFlow ---
+# This makes the ANN model optional. If TensorFlow has a local installation issue,
+# the app will still run without the ANN part, preventing a crash.
+TENSORFLOW_AVAILABLE = False
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import Dense
+    TENSORFLOW_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    # This will catch both simple import errors and deeper issues like DLL failures
+    st.session_state['tensorflow_error'] = True # Store error state
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
@@ -42,34 +60,57 @@ st.markdown("""
 # --- DATA LOADING AND PREPROCESSING ---
 @st.cache_data
 def load_and_prep_data():
-    """Loads and splits the dataset for evaluation."""
+    """Loads, splits, and scales the dataset. Cached for efficiency."""
     try:
         df = pd.read_excel("Folds5x2_pp.xlsx")
         X = df.drop(['PE'], axis=1)
         y = df['PE']
-        # We only need the test set to evaluate the pre-trained model
-        _, X_test, _, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
         
-        return df, X_test, y_test
-    except FileNotFoundError:
-        st.error("Could not find 'Folds5x2_pp.xlsx'. Please ensure it's in your GitHub repository.")
-        return None, None, None
-
-df, X_test, y_test = load_and_prep_data()
-
-# --- MODEL LOADING CACHE ---
-@st.cache_resource
-def load_model_and_scaler():
-    """Loads the pre-trained model and scaler from joblib files."""
-    try:
-        model = joblib.load("best_power_plant_model.joblib")
         scaler = joblib.load("scaler.joblib")
-        return model, scaler
+        X_train_scaled = scaler.transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        return df, X_train_scaled, X_test_scaled, y_train, y_test
     except FileNotFoundError:
-        st.error("Could not find 'best_power_plant_model.joblib' or 'scaler.joblib'. Please ensure they are in your GitHub repository.")
-        return None, None
+        st.error("Could not find 'Folds5x2_pp.xlsx' or 'scaler.joblib'. Please ensure they are in the same directory as app.py.")
+        return None, None, None, None, None
 
-model, scaler = load_model_and_scaler()
+df, X_train_scaled, X_test_scaled, y_train, y_test = load_and_prep_data()
+
+
+# --- MODEL TRAINING CACHE ---
+@st.cache_resource
+def get_trained_models():
+    """Trains and caches all models to avoid retraining on every interaction."""
+    models = {
+        "Linear Regression": LinearRegression(),
+        "Random Forest": RandomForestRegressor(n_estimators=100, random_state=42),
+        "XGBoost Regressor": XGBRegressor(n_estimators=100, random_state=42)
+    }
+    for name, model in models.items():
+        model.fit(X_train_scaled, y_train)
+    
+    # Load the best model
+    try:
+        models["Best Model (Tuned XGBoost)"] = joblib.load("best_power_plant_model.joblib")
+    except FileNotFoundError:
+        st.warning("Could not load 'best_power_plant_model.joblib'.")
+    
+    # Train ANN if TensorFlow is available
+    if TENSORFLOW_AVAILABLE:
+        with st.spinner("Training Neural Network... (one-time process)"):
+            ann_model = Sequential([
+                Dense(128, activation='relu', input_shape=[X_train_scaled.shape[1]]),
+                Dense(64, activation='relu'),
+                Dense(32, activation='relu'),
+                Dense(1)
+            ])
+            ann_model.compile(optimizer='adam', loss='mean_squared_error')
+            ann_model.fit(X_train_scaled, y_train, epochs=50, batch_size=32, verbose=0)
+            models["Artificial Neural Network"] = ann_model
+            
+    return models
 
 # --- HOME PAGE ---
 def home_page():
@@ -110,21 +151,30 @@ def home_page():
                 st.pyplot(pairplot_fig)
 
 
-# --- MODEL PERFORMANCE PAGE (MODIFIED FOR EFFICIENCY) ---
+# --- MODEL PERFORMANCE PAGE ---
 def model_performance_page():
-    st.title("🤖 Best Model Performance")
-    st.write("This page shows the performance of the best pre-trained model (Tuned XGBoost) on the test data.")
+    st.title("🤖 Model Performance Comparison")
+    st.write("Select a model from the dropdown to view its performance details, including prediction tables and plots.")
     
-    if model is None or scaler is None or X_test is None or y_test is None:
-        st.error("Model, scaler, or test data could not be loaded. The app cannot display performance.")
+    all_models = get_trained_models()
+    model_names = list(all_models.keys())
+    
+    if not model_names:
+        st.error("No models were loaded. Please check the console for errors.")
         return
 
-    # Scale the test data and make predictions
-    X_test_scaled = scaler.transform(X_test)
-    y_pred = model.predict(X_test_scaled)
+    selected_model_name = st.selectbox("Select a Model", model_names)
+    
+    model = all_models[selected_model_name]
+
+    # Make predictions
+    if selected_model_name == "Artificial Neural Network":
+        y_pred = model.predict(X_test_scaled).flatten()
+    else:
+        y_pred = model.predict(X_test_scaled)
 
     # --- Display Results ---
-    st.subheader("Results for: Best Model (Tuned XGBoost)")
+    st.subheader(f"Results for: {selected_model_name}")
     
     # Create and display the predictions table with the difference
     st.subheader("Predictions Table")
@@ -162,10 +212,13 @@ def model_performance_page():
 # --- PREDICTION PAGE ---
 def prediction_page():
     st.title("💡 Make a Prediction")
-    st.write("Enter the values for the following features to predict the energy output using the best model.")
+    st.write("Enter the values for the following features to predict the energy output using the **Best Model**.")
     
-    if model is None or scaler is None:
-        st.error("Prediction model or scaler could not be loaded.")
+    try:
+        model = get_trained_models()["Best Model (Tuned XGBoost)"]
+        scaler = joblib.load("scaler.joblib")
+    except (FileNotFoundError, KeyError):
+        st.error("Prediction model or scaler could not be loaded. Please ensure required files are present.")
         return
 
     col1, col2 = st.columns(2)
@@ -184,8 +237,10 @@ def prediction_page():
 
         st.subheader("Prediction Result")
         
-        plot_col, _ = st.columns([0.6, 0.4])
+        # Use columns to control the size of the pie chart
+        plot_col, _ = st.columns([0.6, 0.4]) # Give 60% of the space to the plot column
         with plot_col:
+            # Pie chart visualization
             max_output = df['PE'].max()
             remainder = max_output - predicted_value if max_output > predicted_value else 0
             
@@ -194,10 +249,10 @@ def prediction_page():
             colors = ['#0c2d5e', '#d3d3d3']
             explode = (0.1, 0)
 
-            fig, ax = plt.subplots(figsize=(6, 5))
+            fig, ax = plt.subplots(figsize=(6, 5)) # Made the figure size smaller
             ax.pie(sizes, explode=explode, labels=labels, autopct='%1.1f%%',
                    shadow=True, startangle=90, colors=colors)
-            ax.axis('equal')
+            ax.axis('equal') # Equal aspect ratio ensures that pie is drawn as a circle.
             
             st.pyplot(fig)
 
@@ -205,6 +260,9 @@ def prediction_page():
 # --- MAIN APP LOGIC ---
 st.sidebar.title("Navigation")
 page_options = ["Home", "Model Performance", "Prediction"]
+if 'tensorflow_error' in st.session_state:
+    st.sidebar.warning("ANN model disabled: TensorFlow failed to import. This is likely a local environment issue.")
+
 page = st.sidebar.radio("Choose a page:", page_options)
 
 if df is not None:
